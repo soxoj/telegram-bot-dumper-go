@@ -10,8 +10,11 @@ import (
 
 // Config holds all configuration for the application
 type Config struct {
-	ApiID           int
-	ApiHash         string
+	// Loaded from config.json (auto-created on first run)
+	ApiID   int
+	ApiHash string
+	Phone   string // only needed for trap mode
+
 	Token           string
 	ListenOnly      bool
 	Lookahead       int
@@ -26,8 +29,6 @@ type Config struct {
 func LoadConfig() (*Config, error) {
 	flag.Usage = customUsage
 
-	apiID := flag.Int("api-id", 0, "Telegram API ID (required)")
-	apiHash := flag.String("api-hash", "", "Telegram API Hash (required)")
 	token := flag.String("token", "", "Bot token (prompted interactively if omitted)")
 	listenOnly := flag.Bool("listen-only", false, "Only listen for new messages, don't dump history")
 	lookahead := flag.Int("lookahead", 0, "Additional cycles to check for empty messages")
@@ -37,9 +38,16 @@ func LoadConfig() (*Config, error) {
 	outputFile := flag.String("output-file", "", "Append new messages to this file")
 	flag.Parse()
 
+	// Load or create persistent config (api_id, api_hash, phone)
+	appCfg, err := LoadOrCreateAppConfig()
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
-		ApiID:           *apiID,
-		ApiHash:         *apiHash,
+		ApiID:           appCfg.ApiID,
+		ApiHash:         appCfg.ApiHash,
+		Phone:           appCfg.Phone,
 		Token:           *token,
 		ListenOnly:      *listenOnly,
 		Lookahead:       *lookahead,
@@ -67,8 +75,7 @@ func LoadConfig() (*Config, error) {
 // validate checks that all required fields are present
 func (c *Config) validate() error {
 	if c.ApiID == 0 || c.ApiHash == "" {
-		flag.Usage()
-		return fmt.Errorf("--api-id and --api-hash are required")
+		return fmt.Errorf("api_id and api_hash are required — delete config.json and re-run to set them up")
 	}
 	return nil
 }
@@ -132,6 +139,8 @@ func (c *Config) Close() error {
 // customUsage prints usage with double-dash flags
 func customUsage() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "\n  Credentials (api_id, api_hash, phone) are stored in config.json.\n")
+	fmt.Fprintf(os.Stderr, "  On first run you'll be prompted to set them up.\n\n")
 	flag.VisitAll(func(f *flag.Flag) {
 		var typeStr string
 		defValue := f.DefValue
