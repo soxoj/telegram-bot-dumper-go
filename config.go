@@ -23,9 +23,19 @@ type Config struct {
 	ExcludeExtsFile string
 	OutputFile      string
 	OutputFileHandle *os.File
+
+	// Trap mode fields
+	TrapEnabled     bool
+	TrapMode        string // "per-bot" or "shared"
+	TrapGroupID     int64  // Existing group ID for shared mode
+	TrapGroupPrefix string // Custom prefix for trap group names
+	TokensFile      string // File containing bot tokens (one per line)
+	MaxMsgID        int    // Max message ID to scan during discovery
+	DumpAndForward  bool   // Also run normal dump alongside forwarding
 }
 
-// LoadConfig parses command line flags and returns a validated Config
+// LoadConfig parses command line flags, loads (or creates) the persistent
+// config file, and returns a fully-validated Config.
 func LoadConfig() (*Config, error) {
 	flag.Usage = customUsage
 
@@ -36,9 +46,18 @@ func LoadConfig() (*Config, error) {
 	excludeExts := flag.String("exclude-exts", "", "Comma-separated extensions to skip (e.g. pdf,php,txt)")
 	excludeExtsFile := flag.String("exclude-exts-file", "", "File with excluded extensions (one per line)")
 	outputFile := flag.String("output-file", "", "Append new messages to this file")
+
+	// Trap mode
+	trapEnabled := flag.Bool("trap", false, "Enable trap mode: create groups, invite bots, forward their messages")
+	trapMode := flag.String("trap-mode", "per-bot", "'per-bot' (one group per token) or 'shared' (one group for all)")
+	trapGroupID := flag.Int64("trap-group-id", 0, "Existing group ID for shared mode (0 = auto-create)")
+	trapGroupPrefix := flag.String("trap-prefix", "dump", "Prefix for auto-created trap group names")
+	tokensFile := flag.String("tokens-file", "", "File with bot tokens (one per line)")
+	maxMsgID := flag.Int("max-msg-id", 10000, "Max message ID to scan during trap discovery")
+	dumpAndForward := flag.Bool("dump-and-forward", false, "Also run normal dump alongside trap forwarding")
 	flag.Parse()
 
-	// Load or create persistent config (api_id, api_hash, phone)
+	// ── Load or create persistent config (api_id, api_hash, phone) ──
 	appCfg, err := LoadOrCreateAppConfig()
 	if err != nil {
 		return nil, err
@@ -54,17 +73,27 @@ func LoadConfig() (*Config, error) {
 		UseTor:          *useTor,
 		ExcludeExtsFile: *excludeExtsFile,
 		OutputFile:      *outputFile,
+		TrapEnabled:     *trapEnabled,
+		TrapMode:        *trapMode,
+		TrapGroupID:     *trapGroupID,
+		TrapGroupPrefix: *trapGroupPrefix,
+		TokensFile:      *tokensFile,
+		MaxMsgID:        *maxMsgID,
+		DumpAndForward:  *dumpAndForward,
 	}
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+
 	if err := cfg.loadExcludedExts(*excludeExts); err != nil {
 		return nil, err
 	}
+
 	if err := cfg.setupOutputFile(); err != nil {
 		return nil, err
 	}
+
 	if err := cfg.ensureToken(); err != nil {
 		return nil, err
 	}
@@ -77,6 +106,16 @@ func (c *Config) validate() error {
 	if c.ApiID == 0 || c.ApiHash == "" {
 		return fmt.Errorf("api_id and api_hash are required — delete config.json and re-run to set them up")
 	}
+
+	if c.TrapEnabled {
+		if c.TrapMode != "per-bot" && c.TrapMode != "shared" {
+			return fmt.Errorf("--trap-mode must be 'per-bot' or 'shared'")
+		}
+		if c.Token == "" && c.TokensFile == "" {
+			return fmt.Errorf("trap mode requires --token or --tokens-file")
+		}
+	}
+
 	return nil
 }
 
@@ -117,6 +156,9 @@ func (c *Config) setupOutputFile() error {
 // ensureToken makes sure we have at least one bot token
 func (c *Config) ensureToken() error {
 	if c.Token != "" {
+		return nil
+	}
+	if c.TrapEnabled && c.TokensFile != "" {
 		return nil
 	}
 
