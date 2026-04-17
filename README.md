@@ -1,120 +1,150 @@
 # telegram-bot-dumper (Go version)
 
-Easy dumping of all Telegram bot stuff.
-
-**Input**: bot token, API ID, and API Hash.
-
-**Output**: bot name & info, all chats text history & media, bot's users info & photos.
-
-## Requirements
-
-- Go >= 1.21
-- [Register Telegram application](https://core.telegram.org/api/obtaining_api_id) to get API_ID and API_HASH
+Easy dumping of all Telegram bot stuff — with an advanced **trap mode** that creates groups, invites bots, discovers their accessible chats, and forwards all messages to your trap groups.
 
 ## Installation
 
 ```sh
-cd tg_go
 go mod download
 go build -o dumper
 ```
 
-## Usage
+## First Run
 
-```sh
-./dumper --api-id YOUR_API_ID --api-hash "YOUR_API_HASH" --token "BOT_TOKEN"
+On first run you'll be prompted to enter your Telegram API credentials:
+
+```
+╔══════════════════════════════════════════════════════════╗
+║              FIRST-RUN SETUP                            ║
+║                                                         ║
+║  Register a Telegram app at https://my.telegram.org     ║
+║  to get your API ID and API Hash.                       ║
+║                                                         ║
+║  These will be saved to config.json so you only         ║
+║  have to do this once.                                  ║
+╚══════════════════════════════════════════════════════════╝
+
+  API ID: 12345678
+  API Hash: abcdef1234567890abcdef1234567890
+  Phone number (with country code, e.g. 14155551234): 14155551234
+
+  ✓ Saved to config.json
 ```
 
-### Command Line Arguments
+Credentials are stored in `config.json` next to the binary. You'll never be asked again unless you delete it.
 
-- `--api-id` (required): Telegram API ID
-- `--api-hash` (required): Telegram API Hash  
-- `--token`: Bot token (can also be entered interactively if not provided)
-- `--listen-only`: Only listen for new messages, don't dump history
-- `--lookahead`: Number of additional cycles to skip empty messages (default: 0)
-- `--tor`: Enable Tor SOCKS5 proxy (127.0.0.1:9050)
-- `--exclude-exts`: Comma-separated list of file extensions to exclude from downloading (e.g., `pdf,php,txt`)
-- `--exclude-exts-file`: Path to file with excluded extensions (one per line). Cannot be used together with `--exclude-exts`
-- `--output-file`: Path to file where output for NEW messages will be saved (appended)
+The phone number is only needed for **trap mode** (user account auth). For normal bot dumping you can leave it blank.
 
-### Examples
+## Normal Mode
 
-Basic usage:
+Standard bot dumper — authenticates as a bot and extracts message history.
+
 ```sh
-./dumper --api-id 12345 --api-hash "abcdef123456" --token "12345678:ABCDEFJHKLMNOPQRSTUVWXYZ"
+# With token flag
+./dumper --token "12345678:ABCDEF..."
+
+# Interactive (prompts for token)
+./dumper
 ```
 
-With lookahead (check additional 5*200 = 1000 messages):
+### Flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--token` | Bot token (interactive prompt if omitted) | — |
+| `--listen-only` | Only listen for new messages, skip history dump | false |
+| `--lookahead` | Additional empty-message cycles to check | 0 |
+| `--tor` | Enable Tor SOCKS5 proxy (127.0.0.1:9050) | false |
+| `--exclude-exts` | Comma-separated file extensions to skip | — |
+| `--exclude-exts-file` | File with excluded extensions (one per line) | — |
+| `--output-file` | File to append new messages to | — |
+
+## 🪤 Trap Mode
+
+Trap mode uses your **user account** to create groups, invite target bots, then uses the bot's own MTProto session to discover all its accessible chats and **forward every message** to your trap groups.
+
+### How It Works
+
+1. User account authenticates (OTP + 2FA on first run, session cached after)
+2. For each bot token:
+   - Bot authenticates via MTProto → gets its username
+   - User creates a trap group and adds the bot
+   - Bot's message ID space is scanned to discover all accessible chats
+   - All messages forwarded to the trap group
+3. Results saved per-bot with chat manifests
+
+### Usage
+
 ```sh
-./dumper --api-id 12345 --api-hash "abcdef123456" --token "BOT_TOKEN" --lookahead 5
+# Single bot — one dedicated trap group
+./dumper --trap --token "BOT_TOKEN"
+
+# Multiple bots from file — one group per bot
+./dumper --trap --tokens-file tokens.txt
+
+# Multiple bots — shared group
+./dumper --trap --trap-mode shared --tokens-file tokens.txt
+
+# Deep scan with custom prefix
+./dumper --trap --trap-prefix "harvest" --max-msg-id 50000 --lookahead 10 --tokens-file tokens.txt
+
+# Trap + normal dump simultaneously
+./dumper --trap --dump-and-forward --token "BOT_TOKEN"
+
+# Reuse existing group for shared mode
+./dumper --trap --trap-mode shared --trap-group-id 123456789 --tokens-file tokens.txt
 ```
 
-With Tor proxy:
-```sh
-./dumper --api-id 12345 --api-hash "abcdef123456" --token "BOT_TOKEN" --tor
+### Trap Flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--trap` | **Enable trap mode** | false |
+| `--trap-mode` | `per-bot` or `shared` | per-bot |
+| `--trap-group-id` | Existing group ID for shared mode (0 = create) | 0 |
+| `--trap-prefix` | Prefix for auto-created group names | dump |
+| `--tokens-file` | File with bot tokens (one per line) | — |
+| `--max-msg-id` | Discovery scan depth | 10000 |
+| `--dump-and-forward` | Also run normal dump alongside forwarding | false |
+
+### Tokens File Format
+
+```
+12345678:AABBccDDeeFFggHH
+87654321:ZZYYxxWWvvUUttSS
+# Comments and blank lines are ignored
 ```
 
-Listen-only mode (no history dump):
-```sh
-./dumper --api-id 12345 --api-hash "abcdef123456" --token "BOT_TOKEN" --listen-only
+### Output
+
+```
+trap_12345678/
+├── trap_12345678.json         # Results summary
+└── trap_12345678_chats.json   # Discovered chats manifest
 ```
 
-Exclude specific file extensions (comma-separated):
-```sh
-./dumper --api-id 12345 --api-hash "abcdef123456" --token "BOT_TOKEN" --exclude-exts "pdf,php,txt"
+## Output Structure (Normal Mode)
+
+```
+1234567890/
+├── bot.json
+├── {user_id}/
+│   ├── {user_id}.json
+│   ├── {user_id}_history.txt
+│   └── media/
+│       ├── {photo_id}.jpg
+│       └── {document_id}.{ext}
+└── {photo_id}.jpg
 ```
 
-Exclude file extensions from file:
-```sh
-./dumper --api-id 12345 --api-hash "abcdef123456" --token "BOT_TOKEN" --exclude-exts-file "excluded.txt"
-```
+## Files
 
-Save new messages output to file:
-```sh
-./dumper --api-id 12345 --api-hash "abcdef123456" --token "BOT_TOKEN" --output-file "new_messages.log"
-```
-
-## Output Structure
-
-The dumper creates a directory named after the bot ID (e.g., `1234567890/`) containing:
-
-- `bot.json` - Bot information
-- `{user_id}/` - Directory for each user
-  - `{user_id}.json` - User information
-  - `{user_id}_history.txt` - Text history with the user
-  - `media/` - Media files (photos, documents)
-    - `{photo_id}.jpg` - Photos
-    - `{document_id}.{ext}` - Documents
-  - `{photo_id}.jpg` - User profile photos
-
-## Differences from Python Version
-
-- API_ID and API_HASH are required command-line arguments (not hardcoded)
-- Uses gotd/td library instead of Telethon
-- Written in Go for better performance and easier deployment
+| File | Purpose |
+|------|---------|
+| `config.json` | API credentials (auto-created, gitignored) |
+| `user_session.json` | Telegram user session (auto-created, gitignored) |
 
 ## Known Issues
 
-1. **Bot is exiting with not fully dumped history**
-
-Some messages can be deleted by bot users. If you suppose that the history was not completely dumped, specify cycles count to skip empty messages (200 per cycle by default):
-
-```sh
-./dumper --api-id 12345 --api-hash "abcdef" --token "BOT_TOKEN" --lookahead 5
-```
-
-2. **History was not dumped for chats**
-
-This is a known limitation. The dumper attempts to get all chats, but some edge cases may not be handled.
-
-## Testing
-
-You can test the dumper with a test bot token:
-
-```sh
-TEST_TOKEN="your_test_token" go test ./...
-```
-
-## License
-
-See LICENSE file in the parent directory.
+1. **Incomplete history** — Some messages may be deleted. Use `--lookahead` to check additional cycles.
+2. **First-run auth** — Trap mode prompts for OTP code (and 2FA if enabled) on first run. After that, `user_session.json` is reused.

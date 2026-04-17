@@ -16,15 +16,13 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-const VERSION = "v3-2026-01-22-13-10"
+const VERSION = "v4-2026-04-16-trap"
 
 func main() {
-	// Print version and executable path for debugging
 	exePath, _ := os.Executable()
 	fmt.Printf("=== DUMPER VERSION: %s ===\n", VERSION)
 	fmt.Printf("=== EXECUTABLE: %s ===\n", exePath)
 
-	// Load configuration
 	cfg, err := LoadConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -32,29 +30,217 @@ func main() {
 	}
 	defer cfg.Close()
 
-	// Extract bot ID from token
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\nShutting down...")
+		cancel()
+	}()
+
+	if cfg.TrapEnabled {
+		if err := runTrapMode(ctx, cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Trap mode error: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		if err := runNormalMode(ctx, cfg); err != nil {
+			if err == context.Canceled {
+				fmt.Println("Shutdown complete")
+				return
+			}
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+}
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+// makeTorResolver returns a DCS resolver through Tor, or nil + error
+func makeTorResolver() (dcs.Resolver, error) {
+	socks5Dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, proxy.Direct)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Tor proxy: %w", err)
+	}
+	contextDialer, ok := socks5Dialer.(proxy.ContextDialer)
+	if !ok {
+		return nil, fmt.Errorf("SOCKS5 dialer does not support ContextDialer")
+	}
+	return dcs.Plain(dcs.PlainOptions{Dial: contextDialer.DialContext}), nil
+}
+
+// ── TRAP MODE ───────────────────────────────────────────────────────
+
+func runTrapMode(ctx context.Context, cfg *Config) error {
+	PrintTrapBanner()
+
+	// Collect bot tokens
+	var tokens []string
+	if cfg.TokensFile != "" {
+		t, err := LoadTokensFromFile(cfg.TokensFile)
+		if err != nil {
+			return fmt.Errorf("failed to load tokens file: %w", err)
+		}
+		tokens = append(tokens, t...)
+		fmt.Printf("[TRAP] Loaded %d bot tokens from %s\n", len(t), cfg.TokensFile)
+	}
+	if cfg.Token != "" {
+		tokens = append(tokens, cfg.Token)
+	}
+	if len(tokens) == 0 {
+		return fmt.Errorf("no bot tokens provided")
+	}
+	fmt.Printf("[TRAP] Processing %d bot token(s) in '%s' mode\n", len(tokens), cfg.TrapMode)
+
+	// User client for group creation / bot invitation
+	appCfg := &UserAppConfig{
+		Phone:   cfg.Phone,
+		ApiID:   cfg.ApiID,
+		ApiHash: cfg.ApiHash,
+	}
+	userAuth := NewUserAuth(appCfg, cfg.UseTor)
+	userClient := userAuth.CreateClient()
+
+	return userClient.Run(ctx, func(ctx context.Context) error {
+		userAPI, err := userAuth.Authenticate(ctx)
+		if err != nil {
+			return fmt.Errorf("user authentication failed: %w", err)
+		}
+
+		// Print who we are
+		me, err := userAPI.UsersGetFullUser(ctx, &tg.InputUserSelf{})
+		if err != nil {
+			return fmt.Errorf("failed to get user info: %w", err)
+		}
+		if len(me.Users) > 0 {
+			if user, ok := me.Users[0].(*tg.User); ok {
+				fmt.Printf("[TRAP] User account: %s %s (@%s, ID: %d)\n",
+					user.FirstName, user.LastName, user.Username, user.ID)
+			}
+		}
+
+		trapCfg := &TrapConfig{
+			Enabled:       true,
+			Mode:          TrapMode(cfg.TrapMode),
+			SharedGroupID: cfg.TrapGroupID,
+			GroupTitle:     cfg.TrapGroupPrefix,
+		}
+
+		for i, token := range tokens {
+			fmt.Printf("\n[TRAP] === Bot %d/%d ===\n", i+1, len(tokens))
+
+			if err := processBotTrap(ctx, cfg, userAPI, trapCfg, token); err != nil {
+				fmt.Printf("[TRAP] Error processing bot token %d: %v\n", i+1, err)
+				continue
+			}
+
+			if i < len(tokens)-1 {
+				fmt.Printf("[TRAP] Waiting 2s before next bot...\n")
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(2 * time.Second):
+				}
+			}
+		}
+
+		fmt.Printf("\n[TRAP] ============================================================\n")
+		fmt.Printf("[TRAP] All %d bots processed\n", len(tokens))
+		fmt.Printf("[TRAP] ============================================================\n")
+		return nil
+	})
+}
+
+func processBotTrap(ctx context.Context, cfg *Config, userAPI *tg.Client, trapCfg *TrapConfig, botToken string) error {
+	botIDStr := strings.Split(botToken, ":")[0]
+
+	botOpts := telegram.Options{}
+	if cfg.UseTor {
+		resolver, err := makeTorResolver()
+		if err != nil {
+			return err
+		}
+		botOpts.Resolver = resolver
+	}
+
+	botClient := telegram.NewClient(cfg.ApiID, cfg.ApiHash, botOpts)
+
+	return botClient.Run(ctx, func(ctx context.Context) error {
+		if _, err := botClient.Auth().Bot(ctx, botToken); err != nil {
+			return fmt.Errorf("failed to authenticate bot %s: %w", botIDStr, err)
+		}
+
+		botAPI := tg.NewClient(botClient)
+		rateLimiter := DefaultRateLimiter()
+
+		basePath := fmt.Sprintf("trap_%s", botIDStr)
+		os.MkdirAll(basePath, 0755)
+		storage := NewStorage(basePath)
+
+		trap := NewTrapOrchestrator(userAPI, trapCfg, rateLimiter, storage)
+		trap.SetBotAPI(botAPI)
+
+		if err := trap.RunTrapMode(ctx, botToken, cfg.MaxMsgID, cfg.Lookahead); err != nil {
+			return fmt.Errorf("trap mode failed for bot %s: %w", botIDStr, err)
+		}
+
+		if err := trap.SaveDiscoveredChatsManifest(botIDStr); err != nil {
+			fmt.Printf("[TRAP] Warning: failed to save chats manifest: %v\n", err)
+		}
+
+		if cfg.DumpAndForward {
+			fmt.Printf("[TRAP] Running normal dump for bot %s...\n", botIDStr)
+			dumpBasePath := botIDStr
+			os.MkdirAll(dumpBasePath, 0755)
+			dumpStorage := NewStorage(dumpBasePath)
+			mediaHandler := NewMediaHandler(dumpStorage, botAPI, rateLimiter, cfg.ExcludeExts)
+			userHandler := NewUserHandler(dumpStorage, botAPI, rateLimiter)
+			msgProcessor := NewMessageProcessor(dumpStorage, mediaHandler, userHandler,
+				mustParseInt64(botIDStr), cfg.OutputFileHandle)
+
+			dumper := &Dumper{
+				api:          botAPI,
+				storage:      dumpStorage,
+				mediaHandler: mediaHandler,
+				userHandler:  userHandler,
+				msgProcessor: msgProcessor,
+				botID:        mustParseInt64(botIDStr),
+				rateLimiter:  rateLimiter,
+			}
+
+			if err := dumper.GetChatHistory(ctx, 200, 0, cfg.Lookahead); err != nil {
+				fmt.Printf("[TRAP] Warning: normal dump failed: %v\n", err)
+			}
+		}
+
+		return nil
+	})
+}
+
+// ── NORMAL MODE ─────────────────────────────────────────────────────
+
+func runNormalMode(ctx context.Context, cfg *Config) error {
 	botIDStr := strings.Split(cfg.Token, ":")[0]
 	if botIDStr == "" {
-		fmt.Fprintf(os.Stderr, "Error: invalid bot token format\n")
-		os.Exit(1)
+		return fmt.Errorf("invalid bot token format")
 	}
 
 	botID, err := strconv.ParseInt(botIDStr, 10, 64)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to parse bot ID: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to parse bot ID: %w", err)
 	}
 
-	// Setup base path
 	basePath := botIDStr
 	if _, err := os.Stat(basePath); err == nil {
-		// Directory exists, rename it with timestamp
 		newPath := fmt.Sprintf("%s_%d", basePath, time.Now().Unix())
 		if err := os.Rename(basePath, newPath); err != nil {
 			fmt.Printf("Warning: failed to rename existing directory: %v\n", err)
 		} else {
 			fmt.Printf("Renamed existing directory to %s\n", newPath)
-			// Copy session file if it exists
 			sessionFile := fmt.Sprintf("%s/%s.session", newPath, basePath)
 			if _, err := os.Stat(sessionFile); err == nil {
 				newSessionFile := fmt.Sprintf("%s/%s.session", basePath, basePath)
@@ -65,61 +251,30 @@ func main() {
 		}
 	}
 	if err := os.MkdirAll(basePath, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to create base directory: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to create base directory: %w", err)
 	}
 
-	// Create update dispatcher
 	dispatcher := tg.NewUpdateDispatcher()
 
-	// Setup Telegram client options
 	opts := telegram.Options{
 		UpdateHandler: dispatcher,
 	}
-
-	// Setup proxy if Tor is enabled
 	if cfg.UseTor {
-		socks5Dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, proxy.Direct)
+		resolver, err := makeTorResolver()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to create Tor proxy: %v\n", err)
-			os.Exit(1)
+			return err
 		}
-		// Cast to ContextDialer to use DialContext method
-		contextDialer, ok := socks5Dialer.(proxy.ContextDialer)
-		if !ok {
-			fmt.Fprintf(os.Stderr, "Error: SOCKS5 dialer does not support ContextDialer interface\n")
-			os.Exit(1)
-		}
-		opts.Resolver = dcs.Plain(dcs.PlainOptions{
-			Dial: contextDialer.DialContext,
-		})
+		opts.Resolver = resolver
 		fmt.Println("Tor SOCKS5 proxy enabled (127.0.0.1:9050)")
 	}
 
-	// Create Telegram client
 	client := telegram.NewClient(cfg.ApiID, cfg.ApiHash, opts)
 
-	// Run the bot
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle signals for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		fmt.Println("\nShutting down...")
-		cancel()
-	}()
-
-	if err := client.Run(ctx, func(ctx context.Context) error {
-		// Authenticate bot
-		_, err := client.Auth().Bot(ctx, cfg.Token)
-		if err != nil {
+	return client.Run(ctx, func(ctx context.Context) error {
+		if _, err := client.Auth().Bot(ctx, cfg.Token); err != nil {
 			return fmt.Errorf("failed to authenticate bot: %w", err)
 		}
 
-		// Get bot info
 		api := client.API()
 		me, err := api.UsersGetFullUser(ctx, &tg.InputUserSelf{})
 		if err != nil {
@@ -129,11 +284,9 @@ func main() {
 		botUser := me.Users[0].(*tg.User)
 		fmt.Printf("Authenticated as bot: %s (ID: %d)\n", botUser.FirstName, botUser.ID)
 
-		// Print bot info
-		dumper := &Dumper{} // Temporary, will be initialized properly
+		dumper := &Dumper{}
 		dumper.PrintBotInfo(botUser)
 
-		// Save bot info
 		storage := NewStorage(basePath)
 		botInfo := map[string]interface{}{
 			"id":         botUser.ID,
@@ -150,71 +303,46 @@ func main() {
 			fmt.Printf("Warning: failed to save bot info: %v\n", err)
 		}
 
-		// Initialize rate limiter (30 requests per 30 seconds)
 		rateLimiter := DefaultRateLimiter()
 		fmt.Println("Rate limiter initialized: max 30 requests per 30 seconds")
 
-		// Initialize components
 		tgClient := tg.NewClient(client)
 		dumper = NewDumper(tgClient, storage, botID, rateLimiter, cfg.ExcludeExts, cfg.OutputFileHandle)
 		fmt.Printf("[DEBUG] Dumper initialized, botID=%d\n", botID)
 
-		// Setup update handler for new messages (already registered in dispatcher)
 		dispatcher.OnNewMessage(func(ctx context.Context, entities tg.Entities, u *tg.UpdateNewMessage) error {
 			msg, ok := u.Message.(*tg.Message)
 			if !ok || msg.Out {
 				return nil
 			}
-
-			// Process new message (isNewMessage = true)
-			_, err := dumper.msgProcessor.ProcessMessage(ctx, msg, &entities, true)
-			if err != nil {
+			if _, err := dumper.msgProcessor.ProcessMessage(ctx, msg, &entities, true); err != nil {
 				fmt.Printf("Warning: failed to process new message: %v\n", err)
 			}
-
-			// Save buffered messages periodically
 			if err := dumper.msgProcessor.SaveChatsTextHistory(); err != nil {
 				fmt.Printf("Warning: failed to save chat history: %v\n", err)
 			}
-
 			return nil
 		})
 
-		// Dump history if not in listen-only mode
 		if !cfg.ListenOnly {
 			fmt.Println("Starting history dump...")
-			fmt.Fprintf(os.Stderr, "[DEBUG-STDERR] listenOnly=%v\n", cfg.ListenOnly)
-			fmt.Fprintf(os.Stderr, "[DEBUG-STDERR] About to call GetChatHistory\n")
-			// Use GetChatHistory which works like Python version (GetMessagesRequest with ID range)
-			// HistoryDumpStep = 200 (same as Python version)
-			fmt.Fprintf(os.Stderr, "[DEBUG-STDERR] Calling dumper.GetChatHistory(ctx, 200, 0, %d)\n", cfg.Lookahead)
 			if err := dumper.GetChatHistory(ctx, 200, 0, cfg.Lookahead); err != nil {
-				fmt.Fprintf(os.Stderr, "[DEBUG-STDERR] GetChatHistory returned error: %v\n", err)
 				fmt.Printf("Warning: failed to dump history: %v\n", err)
-			} else {
-				fmt.Fprintf(os.Stderr, "[DEBUG-STDERR] GetChatHistory completed successfully\n")
 			}
 		} else {
 			fmt.Println("Listen-only mode: skipping history dump")
 		}
 
 		fmt.Println("Press Ctrl+C to stop listening for new messages...")
-
-		// Keep running until context is canceled
 		<-ctx.Done()
 		return ctx.Err()
-	}); err != nil {
-		if err == context.Canceled {
-			fmt.Println("Shutdown complete")
-			return
-		}
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
+	})
 }
 
-// copyFile copies a file from src to dst
+// ── utilities ───────────────────────────────────────────────────────
+
 func copyFile(src, dst string) error {
+	os.MkdirAll(strings.TrimSuffix(dst, "/"+dst[strings.LastIndex(dst, "/")+1:]), 0755)
 	sourceFile, err := os.Open(src)
 	if err != nil {
 		return err
@@ -229,4 +357,12 @@ func copyFile(src, dst string) error {
 
 	_, err = destFile.ReadFrom(sourceFile)
 	return err
+}
+
+func mustParseInt64(s string) int64 {
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		panic(fmt.Sprintf("mustParseInt64(%q): %v", s, err))
+	}
+	return v
 }
